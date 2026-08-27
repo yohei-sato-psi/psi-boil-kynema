@@ -1,4 +1,4 @@
-#include "src/equation_systems/vof/height_functions.H"
+#include "src/equation_systems/vof/vof_curv_HF.H"
 
 #include <cmath>
 #include "src/core/Field.H"
@@ -14,16 +14,10 @@ using namespace amrex::literals;
 
 namespace kynema_sgf::multiphase {
 
-void compute_height_function_fields(
-    Field& vof,
-    Field& kappa,
-    Field& kappa_exact,
-    Field& kappa_error,
-    Field& iflag,
-    const amrex::Real kappa_ref,
-    const amrex::Real time)
+void curv_HF(
+    Field& vof, Field& kappa, Field& iflag, const amrex::Real time)
 {
-    BL_PROFILE("kynema-sgf::multiphase::compute_height_function_fields");
+    BL_PROFILE("kynema-sgf::multiphase::curv_HF");
 
     const amrex::IntVect ng_HF(height_function_impl::mof);
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
@@ -34,8 +28,6 @@ void compute_height_function_fields(
         "PSI-BOIL curvature extrapolation requires one iflag ghost cell");
 
     kappa.setVal(0.0_rt);
-    kappa_exact.setVal(0.0_rt);
-    kappa_error.setVal(0.0_rt);
     iflag.setVal(0.0_rt);
 
     const int nlevels = vof.repo().num_active_levels();
@@ -138,7 +130,21 @@ void compute_height_function_fields(
         kappa.fillpatch(time);
         iflag.fillpatch(time);
     }
+}
 
+void calc_HF_kappa_error(
+    const Field& kappa,
+    Field& kappa_exact,
+    Field& kappa_error,
+    const Field& iflag,
+    const amrex::Real kappa_ref)
+{
+    BL_PROFILE("kynema-sgf::multiphase::calc_HF_kappa_error");
+
+    kappa_exact.setVal(0.0_rt);
+    kappa_error.setVal(0.0_rt);
+
+    const int nlevels = kappa.repo().num_active_levels();
     for (int lev = 0; lev < nlevels; ++lev) {
         const auto& kappa_arrs = kappa(lev).const_arrays();
         const auto& exact_arrs = kappa_exact(lev).arrays();
@@ -148,10 +154,11 @@ void compute_height_function_fields(
         amrex::ParallelFor(
             kappa_exact(lev),
             [=] AMREX_GPU_DEVICE(int nbx, int i, int j, int k) {
-                if (iflag_arrs[nbx](i, j, k) > 0.0_rt) {
+                if (iflag_arrs[nbx](i, j, k) == 1.0_rt ||
+                    iflag_arrs[nbx](i, j, k) == 2.0_rt) {
                     exact_arrs[nbx](i, j, k) = kappa_ref;
                     error_arrs[nbx](i, j, k) =
-                        kappa_arrs[nbx](i, j, k) - kappa_ref;
+                        std::abs(kappa_arrs[nbx](i, j, k) - kappa_ref);
                 }
             });
     }
@@ -161,12 +168,16 @@ void compute_height_function_fields(
 HeightFunctionStats height_function_statistics(
     const Field& vof,
     const Field& kappa,
+    const Field& kappa_exact,
     const Field& kappa_error,
     const Field& iflag)
 {
     HeightFunctionStats stats;
     amrex::Real kappa_sum = 0.0_rt;
+    amrex::Real abs_error_sum = 0.0_rt;
+    amrex::Real abs_exact_sum = 0.0_rt;
     amrex::Real squared_error_sum = 0.0_rt;
+    amrex::Real exact_scale = 0.0_rt;
 
     const int nlevels = kappa.repo().num_active_levels();
     for (int lev = 0; lev < nlevels; ++lev) {
@@ -188,18 +199,15 @@ HeightFunctionStats height_function_statistics(
         amrex::MultiFab eval_mask(
             kappa(lev).boxArray(), kappa(lev).DistributionMap(), 1, 0,
             amrex::MFInfo(), kappa(lev).Factory());
-        const auto& phi_arrs = vof(lev).const_arrays();
         const auto& iflag_arrs = iflag(lev).const_arrays();
         const auto& level_mask_arrs = level_mask.const_arrays();
         const auto& eval_mask_arrs = eval_mask.arrays();
         amrex::ParallelFor(
             eval_mask,
             [=] AMREX_GPU_DEVICE(int nbx, int i, int j, int k) {
-                const amrex::Real phi = phi_arrs[nbx](i, j, k);
                 if (level_mask_arrs[nbx](i, j, k) > 0 &&
-                    phi > constants::TIGHT_TOL &&
-                    phi < 1.0_rt - constants::TIGHT_TOL &&
-                    iflag_arrs[nbx](i, j, k) > 0.0_rt) {
+                    (iflag_arrs[nbx](i, j, k) == 1.0_rt ||
+                     iflag_arrs[nbx](i, j, k) == 2.0_rt)) {
                     eval_mask_arrs[nbx](i, j, k) = 1.0_rt;
                 } else {
                     eval_mask_arrs[nbx](i, j, k) = 0.0_rt;
@@ -239,14 +247,12 @@ HeightFunctionStats height_function_statistics(
             vof(lev), iflag(lev), level_mask, 0,
             [=] AMREX_GPU_HOST_DEVICE(
                 const amrex::Box& bx,
-                const amrex::Array4<amrex::Real const>& phi,
+                const amrex::Array4<amrex::Real const>& /*phi*/,
                 const amrex::Array4<amrex::Real const>& flag,
                 const amrex::Array4<int const>& mask) -> amrex::Real {
                 amrex::Real sum = 0.0_rt;
                 amrex::Loop(bx, [=, &sum](int i, int j, int k) {
-                    if (mask(i, j, k) > 0 && flag(i, j, k) == 1.0_rt &&
-                        phi(i, j, k) > constants::TIGHT_TOL &&
-                        phi(i, j, k) < 1.0_rt - constants::TIGHT_TOL) {
+                    if (mask(i, j, k) > 0 && flag(i, j, k) == 1.0_rt) {
                         sum += 1.0_rt;
                     }
                 });
@@ -257,14 +263,12 @@ HeightFunctionStats height_function_statistics(
             vof(lev), iflag(lev), level_mask, 0,
             [=] AMREX_GPU_HOST_DEVICE(
                 const amrex::Box& bx,
-                const amrex::Array4<amrex::Real const>& phi,
+                const amrex::Array4<amrex::Real const>& /*phi*/,
                 const amrex::Array4<amrex::Real const>& flag,
                 const amrex::Array4<int const>& mask) -> amrex::Real {
                 amrex::Real sum = 0.0_rt;
                 amrex::Loop(bx, [=, &sum](int i, int j, int k) {
-                    if (mask(i, j, k) > 0 && flag(i, j, k) == 2.0_rt &&
-                        phi(i, j, k) > constants::TIGHT_TOL &&
-                        phi(i, j, k) < 1.0_rt - constants::TIGHT_TOL) {
+                    if (mask(i, j, k) > 0 && flag(i, j, k) == 2.0_rt) {
                         sum += 1.0_rt;
                     }
                 });
@@ -284,7 +288,7 @@ HeightFunctionStats height_function_statistics(
                 return sum;
             });
 
-        stats.l1_error += amrex::ReduceSum(
+        abs_error_sum += amrex::ReduceSum(
             kappa_error(lev), eval_mask, 0,
             [=] AMREX_GPU_HOST_DEVICE(
                 const amrex::Box& bx,
@@ -293,6 +297,19 @@ HeightFunctionStats height_function_statistics(
                 amrex::Real sum = 0.0_rt;
                 amrex::Loop(bx, [=, &sum](int i, int j, int k) {
                     sum += mask(i, j, k) * std::abs(error(i, j, k));
+                });
+                return sum;
+            });
+
+        abs_exact_sum += amrex::ReduceSum(
+            kappa_exact(lev), eval_mask, 0,
+            [=] AMREX_GPU_HOST_DEVICE(
+                const amrex::Box& bx,
+                const amrex::Array4<amrex::Real const>& exact,
+                const amrex::Array4<amrex::Real const>& mask) -> amrex::Real {
+                amrex::Real sum = 0.0_rt;
+                amrex::Loop(bx, [=, &sum](int i, int j, int k) {
+                    sum += mask(i, j, k) * std::abs(exact(i, j, k));
                 });
                 return sum;
             });
@@ -335,7 +352,8 @@ HeightFunctionStats height_function_statistics(
     amrex::ParallelDescriptor::ReduceRealSum(stats.direct_cells);
     amrex::ParallelDescriptor::ReduceRealSum(stats.extrapolated_cells);
     amrex::ParallelDescriptor::ReduceRealSum(kappa_sum);
-    amrex::ParallelDescriptor::ReduceRealSum(stats.l1_error);
+    amrex::ParallelDescriptor::ReduceRealSum(abs_error_sum);
+    amrex::ParallelDescriptor::ReduceRealSum(abs_exact_sum);
     amrex::ParallelDescriptor::ReduceRealSum(squared_error_sum);
     amrex::ParallelDescriptor::ReduceRealMax(stats.linf_error);
 
@@ -343,8 +361,14 @@ HeightFunctionStats height_function_statistics(
         stats.interface_cells - stats.iflag_cells;
     if (stats.iflag_cells > 0.0_rt) {
         stats.kappa_mean = kappa_sum / stats.iflag_cells;
-        stats.l1_error /= stats.iflag_cells;
-        stats.l2_error = std::sqrt(squared_error_sum / stats.iflag_cells);
+        if (abs_exact_sum > std::numeric_limits<amrex::Real>::epsilon()) {
+            stats.l1_error = abs_error_sum / abs_exact_sum;
+            exact_scale = abs_exact_sum / stats.iflag_cells;
+            stats.l2_error =
+                std::sqrt(squared_error_sum / stats.iflag_cells) /
+                exact_scale;
+            stats.linf_error /= exact_scale;
+        }
     }
     return stats;
 }

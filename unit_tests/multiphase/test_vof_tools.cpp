@@ -4,11 +4,13 @@
 #include "ks_test_utils/test_utils.H"
 #include "src/utilities/trig_ops.H"
 #include "src/core/field_ops.H"
+#include "src/equation_systems/vof/vof_curv_HF.H"
 #include "src/equation_systems/vof/volume_fractions.H"
 #include "src/equation_systems/vof/vof_hybridsolver_ops.H"
 #include "src/equation_systems/vof/vof.H"
 #include "src/equation_systems/SchemeTraits.H"
 #include "src/utilities/math_ops.H"
+#include "AMReX_Reduce.H"
 
 using namespace amrex::literals;
 
@@ -39,6 +41,32 @@ protected:
     }
 
     amrex::Real m_dx = 0.25_rt;
+};
+
+class HeightFunctionTest : public MeshTest
+{
+protected:
+    void populate_parameters() override
+    {
+        MeshTest::populate_parameters();
+
+        {
+            amrex::ParmParse pp("amr");
+            amrex::Vector<int> ncell{{16, 16, 16}};
+            pp.add("max_level", 0);
+            pp.add("max_grid_size", 16);
+            pp.addarr("n_cell", ncell);
+        }
+        {
+            amrex::ParmParse pp("geometry");
+            amrex::Vector<amrex::Real> problo{{0.0_rt, 0.0_rt, 0.0_rt}};
+            amrex::Vector<amrex::Real> probhi{{1.0_rt, 1.0_rt, 1.0_rt}};
+            amrex::Vector<int> periodic{{0, 0, 0}};
+            pp.addarr("prob_lo", problo);
+            pp.addarr("prob_hi", probhi);
+            pp.addarr("is_periodic", periodic);
+        }
+    }
 };
 
 namespace {
@@ -113,6 +141,108 @@ void init_vof(kynema_sgf::Field& vof)
         const auto& bx = mfi.validbox();
         initialize_volume_fractions(bx, vof_arr);
     });
+}
+
+void init_height_profile(
+    kynema_sgf::Field& vof,
+    const int dirMax,
+    const amrex::Real h_11,
+    const amrex::Real h_22,
+    const bool invert)
+{
+    constexpr int center = 6;
+    const int mcomp = dirMax - 1;
+    const amrex::Real h11 = h_11;
+    const amrex::Real h22 = h_22;
+    const bool inv = invert;
+
+    run_algorithm(vof, [&](const int lev, const amrex::MFIter& mfi) {
+        const auto& geom = vof.repo().mesh().Geom(lev);
+        const auto dx = geom.CellSizeArray();
+        const auto problo = geom.ProbLoArray();
+        const auto vof_arr = vof(lev).array(mfi);
+        const auto gbx = amrex::grow(mfi.validbox(), vof.num_grow());
+
+        amrex::ParallelFor(gbx, [=] AMREX_GPU_DEVICE(int i, int j, int k) {
+            const amrex::GpuArray<int, 3> index{i, j, k};
+            int dir1 = 0;
+            if (dirMax == 1) {
+                dir1 = 1;
+            }
+            int dir2 = 2;
+            if (dirMax == 3) {
+                dir2 = 1;
+            }
+
+            const amrex::Real x1 =
+                problo[dir1] +
+                (static_cast<amrex::Real>(index[dir1]) + 0.5_rt) * dx[dir1];
+            const amrex::Real x2 =
+                problo[dir2] +
+                (static_cast<amrex::Real>(index[dir2]) + 0.5_rt) * dx[dir2];
+            const amrex::Real x1_center =
+                problo[dir1] +
+                (static_cast<amrex::Real>(center) + 0.5_rt) *
+                    dx[dir1];
+            const amrex::Real x2_center =
+                problo[dir2] +
+                (static_cast<amrex::Real>(center) + 0.5_rt) *
+                    dx[dir2];
+
+            const amrex::Real base_height =
+                problo[mcomp] +
+                (static_cast<amrex::Real>(center) + 0.5_rt) * dx[mcomp];
+            const amrex::Real height =
+                base_height + 0.5_rt * h11 *
+                                      (x1 - x1_center) * (x1 - x1_center) +
+                0.5_rt * h22 *
+                    (x2 - x2_center) * (x2 - x2_center);
+            const amrex::Real cell_low =
+                problo[mcomp] +
+                static_cast<amrex::Real>(index[mcomp]) * dx[mcomp];
+            amrex::Real volume_fraction = amrex::max<amrex::Real>(
+                0.0_rt,
+                amrex::min<amrex::Real>(
+                    1.0_rt, (height - cell_low) / dx[mcomp]));
+            if (inv) {
+                volume_fraction = 1.0_rt - volume_fraction;
+            }
+            vof_arr(i, j, k) = volume_fraction;
+        });
+    });
+    amrex::Gpu::streamSynchronize();
+}
+
+amrex::Real height_function_error(
+    const kynema_sgf::Field& vof,
+    const int expected_dirMax,
+    const amrex::Real kappa_ref)
+{
+    constexpr int center = 6;
+    amrex::Real error = 0.0_rt;
+    for (int lev = 0; lev < vof.repo().num_active_levels(); ++lev) {
+        const auto dx = vof.repo().mesh().Geom(lev).CellSizeArray();
+        error += amrex::ReduceSum(
+            vof(lev), 0,
+            [=] AMREX_GPU_HOST_DEVICE(
+                const amrex::Box& bx,
+                const amrex::Array4<amrex::Real const>& vof_arr) -> amrex::Real {
+                amrex::Real local_error = 0.0_rt;
+                amrex::Loop(bx, [=, &local_error](int i, int j, int k) {
+                    if (i == center && j == center && k == center) {
+                        const auto result =
+                            kynema_sgf::multiphase::height_function_curvature(
+                                i, j, k, vof_arr, dx);
+                        local_error += std::abs(result.kappa - kappa_ref);
+                        local_error += std::abs(result.iflag - 1);
+                        local_error += std::abs(result.dirMax - expected_dirMax);
+                    }
+                });
+                return local_error;
+            });
+    }
+    amrex::ParallelDescriptor::ReduceRealSum(error);
+    return error;
 }
 
 amrex::Real
@@ -326,6 +456,39 @@ TEST_F(VOFToolTest, levelset_to_vof)
     EXPECT_NEAR(error_total, 0.0_rt, 0.016_rt);
 }
 
+TEST_F(HeightFunctionTest, flat_interface)
+{
+    populate_parameters();
+    initialize_mesh();
+
+    auto& vof = sim().repo().declare_field("vof", 1, 3);
+    constexpr amrex::Real tol = 1.0e-12_rt;
+    for (int dirMax = 1; dirMax <= AMREX_SPACEDIM; ++dirMax) {
+        init_height_profile(vof, dirMax, 0.0_rt, 0.0_rt, false);
+        EXPECT_NEAR(height_function_error(vof, dirMax, 0.0_rt), 0.0_rt, tol);
+    }
+}
+
+TEST_F(HeightFunctionTest, quadratic_interface)
+{
+    populate_parameters();
+    initialize_mesh();
+
+    auto& vof = sim().repo().declare_field("vof", 1, 3);
+    constexpr amrex::Real hxx = -2.0_rt;
+    constexpr amrex::Real hyy = -1.0_rt;
+    constexpr amrex::Real kappa_ref = -(hxx + hyy);
+    constexpr amrex::Real tol = 1.0e-11_rt;
+
+    init_height_profile(vof, 3, hxx, hyy, false);
+    EXPECT_NEAR(
+        height_function_error(vof, 3, kappa_ref), 0.0_rt, tol);
+
+    // Reversing C swaps a drop and a bubble and must reverse curvature sign.
+    init_height_profile(vof, 3, hxx, hyy, true);
+    EXPECT_NEAR(
+        height_function_error(vof, 3, -kappa_ref), 0.0_rt, tol);
+}
 TEST_F(VOFToolTest, replace_masked_vof)
 {
 

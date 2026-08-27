@@ -4,6 +4,7 @@
 #include "src/core/MLMGOptions.H"
 #include "src/utilities/console_io.H"
 #include "src/core/field_ops.H"
+#include "src/physics/multiphase/MultiPhase.H"
 #include "src/projection/nodal_projection_ops.H"
 #include "hydro_utils.H"
 #include "src/utilities/math_ops.H"
@@ -170,9 +171,14 @@ void incflo::ApplyProjection(
     }
 
     const bool is_anelastic = m_sim.is_anelastic();
-    const bool variable_density =
-        (!m_sim.pde_manager().constant_density() ||
-         m_sim.physics_manager().contains("MultiPhase"));
+    const bool has_multiphase =
+        m_sim.physics_manager().contains("MultiPhase");
+    bool variable_density = !m_sim.pde_manager().constant_density();
+    if (!variable_density && has_multiphase) {
+        const auto& multiphase =
+            m_sim.physics_manager().get<kynema_sgf::MultiPhase>();
+        variable_density = multiphase.rho1() != multiphase.rho2();
+    }
 
     bool mesh_mapping = m_sim.has_mesh_mapping();
 
@@ -346,8 +352,14 @@ void incflo::ApplyProjection(
             options.lpinfo());
     } else {
         amrex::Real rho_0 = 1.0_rt;
-        amrex::ParmParse pp("incflo");
-        pp.query("density", rho_0);
+        if (has_multiphase) {
+            rho_0 = m_sim.physics_manager()
+                        .get<kynema_sgf::MultiPhase>()
+                        .rho1();
+        } else {
+            amrex::ParmParse pp("incflo");
+            pp.query("density", rho_0);
+        }
 
         nodal_projector = std::make_unique<Hydro::NodalProjector>(
             vel, scaling_factor / rho_0, Geom(0, finest_level),

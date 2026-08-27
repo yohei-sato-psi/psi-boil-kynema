@@ -1,5 +1,5 @@
-#ifndef HEIGHT_FUNCTIONS_H
-#define HEIGHT_FUNCTIONS_H
+#ifndef VOF_CURV_HF_H
+#define VOF_CURV_HF_H
 
 #include <cmath>
 #include <limits>
@@ -294,14 +294,19 @@ height_function_curvature(
  * contained inside the finest level; extrapolated curvature is therefore kept
  * on that level only.
  */
-void compute_height_function_fields(
+void curv_HF(
     Field& vof,
     Field& kappa,
+    Field& iflag,
+    amrex::Real time);
+
+/** Populate exact curvature and absolute error fields for HF validation. */
+void calc_HF_kappa_error(
+    const Field& kappa,
     Field& kappa_exact,
     Field& kappa_error,
-    Field& iflag,
-    amrex::Real kappa_ref,
-    amrex::Real time);
+    const Field& iflag,
+    amrex::Real kappa_ref);
 
 /**
  * Compute composite-grid error norms, excluding coarse cells covered by a
@@ -310,6 +315,7 @@ void compute_height_function_fields(
 HeightFunctionStats height_function_statistics(
     const Field& vof,
     const Field& kappa,
+    const Field& kappa_exact,
     const Field& kappa_error,
     const Field& iflag);
 

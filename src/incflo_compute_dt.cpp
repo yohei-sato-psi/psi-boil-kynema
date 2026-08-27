@@ -3,9 +3,95 @@
 
 #include <cmath>
 #include <limits>
+#include <numbers>
+#include "AMReX_ParmParse.H"
 #include "AMReX_REAL.H"
 
 using namespace amrex::literals;
+
+namespace {
+
+amrex::Real brackbill_capillary_dt(
+    const amrex::Vector<amrex::Geometry>& geom,
+    const int finest_level,
+    const kynema_sgf::SimTime& time)
+{
+    amrex::Real capillary_dt = -1.0_rt;
+    if (!time.use_capillary_dt()) {
+        return capillary_dt;
+    }
+
+    amrex::Real sigma = -1.0_rt;
+    bool has_sigma = false;
+    {
+        amrex::ParmParse pp("VOF");
+        if (pp.contains("sigma")) {
+            pp.get("sigma", sigma);
+            has_sigma = true;
+        }
+        if (pp.contains("surface_tension_coefficient")) {
+            pp.get("surface_tension_coefficient", sigma);
+            has_sigma = true;
+        }
+    }
+
+    if (!has_sigma || sigma <= 0.0_rt) {
+        amrex::Abort(
+            "time.use_capillary_dt requires positive VOF.sigma or "
+            "VOF.surface_tension_coefficient.");
+    }
+
+    amrex::Real rho_ave = -1.0_rt;
+    bool has_rho = false;
+    {
+        amrex::ParmParse pp("time");
+        if (pp.contains("capillary_dt_density")) {
+            pp.get("capillary_dt_density", rho_ave);
+            has_rho = true;
+        }
+    }
+
+    if (!has_rho) {
+        amrex::Real rho1 = -1.0_rt;
+        amrex::Real rho2 = -1.0_rt;
+        amrex::ParmParse pp("MultiPhase");
+        if (pp.contains("density_fluid1") && pp.contains("density_fluid2")) {
+            pp.get("density_fluid1", rho1);
+            pp.get("density_fluid2", rho2);
+            rho_ave = 0.5_rt * (rho1 + rho2);
+            has_rho = true;
+        }
+    }
+
+    if (!has_rho || rho_ave <= 0.0_rt) {
+        amrex::Abort(
+            "time.use_capillary_dt requires positive MultiPhase.density_fluid1 "
+            "and MultiPhase.density_fluid2 or time.capillary_dt_density.");
+    }
+
+    amrex::Real dxmin = std::numeric_limits<amrex::Real>::max();
+    for (int lev = 0; lev <= finest_level; ++lev) {
+        const amrex::Real* dx = geom[lev].CellSize();
+        amrex::Real dxloc = dx[0];
+#if (AMREX_SPACEDIM >= 2)
+        dxloc = amrex::min(dxloc, dx[1]);
+#endif
+#if (AMREX_SPACEDIM >= 3)
+        dxloc = amrex::min(dxloc, dx[2]);
+#endif
+        dxmin = amrex::min(dxmin, dxloc);
+    }
+
+    const amrex::Real denom =
+        2.0_rt * std::numbers::pi_v<amrex::Real> * sigma;
+    capillary_dt =
+        time.capillary_dt_coef() *
+        std::sqrt(rho_ave * dxmin * dxmin * dxmin / denom);
+
+    return capillary_dt;
+}
+
+} // namespace
 
 /** Estimate the new timestep for adaptive timestepping algorithm
  *
@@ -217,7 +303,9 @@ void incflo::compute_dt()
             force_cfl, amrex::ParallelContext::CommunicatorSub());
     }
 
-    m_time.set_current_cfl(conv_cfl, diff_cfl, force_cfl);
+    const amrex::Real capillary_dt =
+        brackbill_capillary_dt(geom, finest_level, m_time);
+    m_time.set_current_cfl(conv_cfl, diff_cfl, force_cfl, capillary_dt);
 }
 
 void incflo::compute_prescribe_dt()
@@ -337,5 +425,7 @@ void incflo::compute_prescribe_dt()
     amrex::ParallelAllReduce::Max<amrex::Real>(
         conv_cfl, amrex::ParallelContext::CommunicatorSub());
 
-    m_time.set_current_cfl(conv_cfl, 0.0_rt, 0.0_rt);
+    const amrex::Real capillary_dt =
+        brackbill_capillary_dt(geom, finest_level, m_time);
+    m_time.set_current_cfl(conv_cfl, 0.0_rt, 0.0_rt, capillary_dt);
 }

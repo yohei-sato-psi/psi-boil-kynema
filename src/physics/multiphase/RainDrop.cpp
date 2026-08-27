@@ -1,6 +1,7 @@
 #include <numbers>
 #include "src/physics/multiphase/RainDrop.H"
 #include "src/physics/multiphase/MultiPhase.H"
+#include "src/equation_systems/vof/vof_lamb_prosperetti.H"
 #include "src/CFDSim.H"
 #include "AMReX_ParmParse.H"
 #include "AMReX_REAL.H"
@@ -18,6 +19,7 @@ RainDrop::RainDrop(CFDSim& sim)
     pp.queryarr("location", m_loc, 0, AMREX_SPACEDIM);
     pp.query("radius", m_radius);
     pp.queryarr("droplet_velocity", m_vel, 0, AMREX_SPACEDIM);
+    pp.query("fluid1_inside", m_fluid1_inside);
 }
 
 /** Initialize the velocity and levelset fields at the beginning of the
@@ -29,6 +31,10 @@ void RainDrop::initialize_fields(int level, const amrex::Geometry& geom)
 {
     auto& velocity = m_velocity(level);
     auto& levelset = m_levelset(level);
+    const bool yes_vof = m_sim.repo().field_exists("vof");
+    bool use_lamb_prosperetti = false;
+    amrex::ParmParse pp_vof("VOF");
+    pp_vof.query("lamb_prosperetti", use_lamb_prosperetti);
     const auto& dx = geom.CellSizeArray();
     const auto& problo = geom.ProbLoArray();
 
@@ -36,28 +42,40 @@ void RainDrop::initialize_fields(int level, const amrex::Geometry& geom)
     const amrex::Real yc = m_loc[1];
     const amrex::Real zc = m_loc[2];
     const amrex::Real radius = m_radius;
+    const bool fluid1_inside = m_fluid1_inside;
     const auto& phi_arrs = levelset.arrays();
-    amrex::ParallelFor(
+    if (!use_lamb_prosperetti || !yes_vof) {
+        amrex::ParallelFor(
         velocity, [=] AMREX_GPU_DEVICE(int nbx, int i, int j, int k) {
             const amrex::Real x = problo[0] + ((i + 0.5_rt) * dx[0]);
             const amrex::Real y = problo[1] + ((j + 0.5_rt) * dx[1]);
             const amrex::Real z = problo[2] + ((k + 0.5_rt) * dx[2]);
 
             // Calculate level-set
+            const amrex::Real distance =
+                std::sqrt(
+                    ((x - xc) * (x - xc)) + ((y - yc) * (y - yc)) +
+                    ((z - zc) * (z - zc)));
             phi_arrs[nbx](i, j, k) =
-                radius - std::sqrt(
-                             ((x - xc) * (x - xc)) + ((y - yc) * (y - yc)) +
-                             ((z - zc) * (z - zc)));
+                fluid1_inside ? radius - distance : distance - radius;
         });
-    amrex::Gpu::streamSynchronize();
+        amrex::Gpu::streamSynchronize();
+    }
 
     auto& mphase = m_sim.physics_manager().get<MultiPhase>();
     // Get VOF array if it is valid
-    const bool yes_vof = m_sim.repo().field_exists("vof");
     amrex::MultiFab* work_ptr;
     if (yes_vof) {
-        auto& volfrac = m_sim.repo().get_field("vof")(level);
-        mphase.levelset2vof();
+        auto& vof = m_sim.repo().get_field("vof");
+        auto& volfrac = vof(level);
+        if (use_lamb_prosperetti) {
+            const auto params = multiphase::lamb_prosperetti_params(
+                m_loc, m_radius, m_fluid1_inside);
+            multiphase::initialize_lamb_prosperetti(
+                vof, m_levelset, level, geom, params);
+        } else {
+            mphase.levelset2vof();
+        }
         work_ptr = &volfrac;
     } else {
         work_ptr = &levelset;

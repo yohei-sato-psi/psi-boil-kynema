@@ -45,6 +45,9 @@ void SimTime::parse_parameters()
     pp.query("plot_start_time", m_plt_start_time);
     pp.query("checkpoint_start_time", m_chkpt_start_time);
     pp.query("use_force_cfl", m_use_force_cfl);
+    pp.query("use_capillary_dt", m_use_capillary_dt);
+    pp.query("capillary_dt_coef", m_capillary_dt_coef);
+    pp.query("surftens_dt_coef", m_capillary_dt_coef);
     pp.query("profiling_interval", m_profiling_interval);
 
     // Tolerances
@@ -57,6 +60,10 @@ void SimTime::parse_parameters()
         m_dt[0] = m_fixed_dt;
     } else {
         m_adaptive = true;
+    }
+
+    if (m_use_capillary_dt && m_capillary_dt_coef <= 0.0_rt) {
+        amrex::Abort("time.capillary_dt_coef must be positive.");
     }
 
     if (m_plt_interval > 0 && m_plt_t_interval > 0.0_rt) {
@@ -128,6 +135,11 @@ bool SimTime::new_timestep()
             amrex::Print() << "  Fixed timestepping with dt = " << m_fixed_dt
                            << "; max. CFL from inputs = " << m_max_cfl << '\n';
         }
+        if (m_use_capillary_dt) {
+            amrex::Print()
+                << "  Brackbill capillary timestep limit enabled with coef. = "
+                << m_capillary_dt_coef << '\n';
+        }
     }
 
     // Toggle initialization state and enter evolution phase
@@ -157,9 +169,12 @@ bool SimTime::new_timestep()
 void SimTime::set_current_cfl(
     const amrex::Real conv_cfl,
     const amrex::Real diff_cfl,
-    const amrex::Real src_cfl)
+    const amrex::Real src_cfl,
+    const amrex::Real capillary_dt)
 {
     bool use_init_dt{false};
+    bool use_capillary_dt_only{false};
+    m_capillary_dt = capillary_dt;
     const amrex::Real cd_cfl = conv_cfl + diff_cfl;
     const amrex::Real cfl_unit_time =
         cd_cfl + std::sqrt((cd_cfl * cd_cfl) + (4.0_rt * src_cfl));
@@ -175,6 +190,11 @@ void SimTime::set_current_cfl(
                     "and the initial dt is not set. Please set the initial dt, "
                     "use a fixed time step, or fix the case setup");
             }
+        } else if (m_use_capillary_dt && m_capillary_dt > 0.0_rt) {
+            // On restart, velocity and explicit-diffusion CFL contributions
+            // can both be zero before mueff is reconstructed. The Brackbill
+            // limit remains a valid positive timestep candidate.
+            use_capillary_dt_only = true;
         } else {
             amrex::Abort(
                 "CFL is below machine epsilon and the time step is adaptive. "
@@ -183,6 +203,8 @@ void SimTime::set_current_cfl(
     }
     amrex::Real dt_new =
         use_init_dt ? m_initial_dt
+        : use_capillary_dt_only
+            ? m_capillary_dt
                     : 2.0_rt * m_max_cfl /
                           amrex::max(
                               cfl_unit_time,
@@ -197,6 +219,10 @@ void SimTime::set_current_cfl(
     if (m_dt[0] > 0.0_rt && m_adaptive) {
         dt_new =
             amrex::min<amrex::Real>(dt_new, (1.0_rt + m_dt_growth) * m_dt[0]);
+    }
+
+    if (m_use_capillary_dt && m_capillary_dt > 0.0_rt) {
+        dt_new = amrex::min(dt_new, m_capillary_dt);
     }
 
     if (m_adaptive) {
@@ -303,18 +329,31 @@ void SimTime::advance_time()
                        << m_diff_cfl * factor
                        << " src: " << std::setprecision(6) << m_src_cfl * factor
                        << " )" << '\n';
+        if (m_use_capillary_dt && m_capillary_dt > 0.0_rt) {
+            amrex::Print() << "Brackbill capillary dt: "
+                           << std::setprecision(6) << m_capillary_dt << '\n';
+        }
     }
     // If user has specified fixed delta_t then issue a warning if the timestep
     // is larger than the delta_t determined from max. CFL considerations.
     // Only issue warnings when the error is greater than 1% of the timestep
     // specified
-    const bool issue_cfl_warning =
-        m_adaptive ? false : (1.0_rt - (m_dt_calc / m_dt[0])) > 0.01_rt;
+    bool issue_cfl_warning = false;
+    if (!m_adaptive && m_dt[0] > 0.0_rt) {
+        if ((1.0_rt - (m_dt_calc / m_dt[0])) > 0.01_rt) {
+            issue_cfl_warning = true;
+        }
+    }
     if (issue_cfl_warning && !m_is_init) {
-        amrex::Print() << "WARNING: fixed_dt does not satisfy CFL condition.\n"
+        amrex::Print() << "WARNING: fixed_dt does not satisfy timestep "
+                          "constraint.\n"
                        << "Max. CFL: " << m_max_cfl
                        << " => dt: " << std::setprecision(6) << m_dt_calc
                        << "; dt_inp: " << m_fixed_dt << '\n';
+        if (m_use_capillary_dt && m_capillary_dt > 0.0_rt) {
+            amrex::Print() << "Brackbill capillary dt limit: "
+                           << std::setprecision(6) << m_capillary_dt << '\n';
+        }
     }
 }
 

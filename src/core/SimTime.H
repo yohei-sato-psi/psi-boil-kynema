@@ -72,7 +72,10 @@ public:
      *
      */
     void set_current_cfl(
-        amrex::Real conv_cfl, amrex::Real diff_cfl, amrex::Real src_cfl);
+        amrex::Real conv_cfl,
+        amrex::Real diff_cfl,
+        amrex::Real src_cfl,
+        amrex::Real capillary_dt = -1.0_rt);
 
     /** Use results of CFL and timestepping parameters to advance time to new,
      * output time information
@@ -133,6 +136,12 @@ public:
 
     AMREX_FORCE_INLINE
     bool use_force_cfl() const { return m_use_force_cfl; }
+
+    AMREX_FORCE_INLINE
+    bool use_capillary_dt() const { return m_use_capillary_dt; }
+
+    AMREX_FORCE_INLINE
+    amrex::Real capillary_dt_coef() const { return m_capillary_dt_coef; }
 
     AMREX_FORCE_INLINE
     int regrid_interval() const { return m_regrid_interval; }
@@ -229,6 +238,12 @@ private:
     //! delta_t calculated using CFL constraint
     amrex::Real m_dt_calc{0.0_rt};
 
+    //! Brackbill capillary timestep limit
+    amrex::Real m_capillary_dt{-1.0_rt};
+
+    //! Coefficient for Brackbill capillary timestep limit
+    amrex::Real m_capillary_dt_coef{1.0_rt};
+
     //! Initial reduction in timestep size for startup
     amrex::Real m_init_shrink{0.1_rt};
 
@@ -318,6 +333,9 @@ private:
 
     //! Flag indicating if forcing should be included in CFL calculation
     bool m_use_force_cfl{true};
+
+    //! Flag indicating if Brackbill capillary timestep limit should be used
+    bool m_use_capillary_dt{false};
 
     //! Bool for if checkpoint time interval should be forced
     bool m_force_chkpt_dt{false};

@@ -50,6 +50,9 @@ private:
     //! Initial Rain Drop velocity
     amrex::Vector<amrex::Real> m_vel{0.0_rt, 0.0_rt, 0.0_rt};
 
+    //! Set fluid 1 inside the spherical interface
+    bool m_fluid1_inside{true};
+
     //! Raindrop radius value
     amrex::Real m_radius{0.003_rt};
 };
